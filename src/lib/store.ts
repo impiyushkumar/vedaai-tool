@@ -20,6 +20,42 @@ export interface Question {
 
 export type AppState = 'upload' | 'processing' | 'mapping';
 
+/** A question after extraction, carrying its grade and located regions. */
+export interface ExtractedQuestion {
+  id: string;
+  number: number;
+  part?: string;
+  text: string;
+  score: number;
+  maxScore: number;
+  feedback: string;
+  status: 'answered' | 'unanswered' | 'orphan';
+  regions: BoundingBox[];
+}
+
+export interface OrphanAnswer {
+  text: string;
+  regions: BoundingBox[];
+}
+
+export interface ExtractResponse {
+  questions: ExtractedQuestion[];
+  orphanAnswers: OrphanAnswer[];
+}
+
+/** One question's grade, as returned per answer-sheet batch. */
+export interface AnswerMapping {
+  questionId: string;
+  score: number;
+  feedback: string;
+  regions: BoundingBox[];
+}
+
+export interface AnswersResponse {
+  mappings: AnswerMapping[];
+  orphanAnswers: OrphanAnswer[];
+}
+
 export interface UploadedFile {
   file: File;
   name: string;

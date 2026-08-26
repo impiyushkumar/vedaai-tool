@@ -6,13 +6,58 @@ import TopBar from "@/components/TopBar";
 import UploadScreen from "@/components/UploadScreen";
 import ProcessingScreen from "@/components/ProcessingScreen";
 import MappingScreen from "@/components/MappingScreen";
-import { getPageCount, renderPdfPages, stripDataUrlPrefix } from "@/lib/pdf";
-import type { AppState, UploadedFile } from "@/lib/store";
+import {
+  API_QUALITY,
+  API_SCALE,
+  getPageCount,
+  renderPdfPages,
+  stripDataUrlPrefix,
+} from "@/lib/pdf";
 import type {
+  AnswerMapping,
+  AnswersResponse,
+  AppState,
   ExtractedQuestion,
-  ExtractResponse,
   OrphanAnswer,
-} from "@/app/api/extract/route";
+  UploadedFile,
+} from "@/lib/store";
+
+/**
+ * Vercel rejects request bodies over 4.5MB before the function runs, so the
+ * answer sheet is sent in batches rather than one request.
+ */
+const PAGES_PER_BATCH = 8;
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const batches: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    batches.push(items.slice(i, i + size));
+  }
+  return batches;
+}
+
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const detail = await response
+      .json()
+      .then((data) => data?.error)
+      .catch(() => null);
+    if (response.status === 413) {
+      throw new Error(
+        "Upload too large for the server. Try a document with fewer pages."
+      );
+    }
+    throw new Error(detail || `Request failed (${response.status})`);
+  }
+
+  return response.json() as Promise<T>;
+}
 
 export default function Page() {
   const [state, setState] = useState<AppState>("upload");
@@ -22,8 +67,8 @@ export default function Page() {
   const [status, setStatus] = useState("Rendering pages...");
   const [error, setError] = useState<string | null>(null);
 
-  // Answer sheet page images are kept as full data URLs for the Phase 5
-  // mapping screen to render directly into <img src>.
+  // Answer sheet page images are kept as full data URLs for the mapping
+  // screen to render directly into <img src>.
   const [answerSheetImages, setAnswerSheetImages] = useState<string[]>([]);
   const [questions, setQuestions] = useState<ExtractedQuestion[]>([]);
   const [orphanAnswers, setOrphanAnswers] = useState<OrphanAnswer[]>([]);
@@ -53,41 +98,79 @@ export default function Page() {
     setState("processing");
 
     try {
-      // Question paper is only ever sent to the API, so 1.0 is enough.
-      // The answer sheet is rendered twice: 1.0 for the request payload and
-      // 2.0 for the mapping screen, where boxes get zoomed into.
+      // The answer sheet is rendered twice: small for the request payload,
+      // and at display scale for the mapping screen.
       const [questionPaperImages, answerImagesForApi, answerImagesForDisplay] =
         await Promise.all([
-          renderPdfPages(questionPaper.file, 1.0),
-          renderPdfPages(answerSheet.file, 1.0),
-          renderPdfPages(answerSheet.file, 2.0),
+          renderPdfPages(questionPaper.file, API_SCALE, API_QUALITY),
+          renderPdfPages(answerSheet.file, API_SCALE, API_QUALITY),
+          renderPdfPages(answerSheet.file),
         ]);
       setAnswerSheetImages(answerImagesForDisplay);
 
       setStatus("Extracting questions...");
 
-      const response = await fetch("/api/extract", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          questionPaperPages: questionPaperImages.map(stripDataUrlPrefix),
-          answerSheetPages: answerImagesForApi.map(stripDataUrlPrefix),
-        }),
+      const { questions: extracted } = await postJson<{
+        questions: ExtractedQuestion[];
+      }>("/api/extract-questions", {
+        pages: questionPaperImages.map(stripDataUrlPrefix),
       });
 
-      if (!response.ok) {
-        const detail = await response
-          .json()
-          .then((data) => data?.error)
-          .catch(() => null);
-        throw new Error(detail || `Extraction request failed (${response.status})`);
+      const answerPages = answerImagesForApi.map(stripDataUrlPrefix);
+      const batches = chunk(answerPages, PAGES_PER_BATCH);
+
+      const allMappings: AnswerMapping[] = [];
+      const allOrphans: OrphanAnswer[] = [];
+
+      // Sequential: batches share one rate limit, and parallel vision calls
+      // over large payloads tend to trip it.
+      for (let index = 0; index < batches.length; index++) {
+        setStatus(
+          batches.length > 1
+            ? `Mapping answers... (batch ${index + 1} of ${batches.length})`
+            : "Mapping answers..."
+        );
+
+        const result = await postJson<AnswersResponse>("/api/extract-answers", {
+          pages: batches[index],
+          questions: extracted,
+          pageOffset: index * PAGES_PER_BATCH,
+        });
+
+        allMappings.push(...result.mappings);
+        allOrphans.push(...result.orphanAnswers);
       }
 
-      setStatus("Mapping answers...");
+      // An answer spanning a batch boundary yields two mappings for one
+      // question; merge their regions and keep the best score.
+      const byQuestionId = new Map<string, AnswerMapping>();
+      for (const mapping of allMappings) {
+        const existing = byQuestionId.get(mapping.questionId);
+        if (!existing) {
+          byQuestionId.set(mapping.questionId, { ...mapping });
+          continue;
+        }
+        existing.regions = [...existing.regions, ...mapping.regions];
+        if (mapping.score > existing.score) existing.score = mapping.score;
+        if (!existing.feedback) existing.feedback = mapping.feedback;
+      }
 
-      const result: ExtractResponse = await response.json();
-      setQuestions(result.questions);
-      setOrphanAnswers(result.orphanAnswers);
+      const merged: ExtractedQuestion[] = extracted.map((question) => {
+        const mapping = byQuestionId.get(question.id);
+        if (!mapping) {
+          return { ...question, status: "unanswered", score: 0, regions: [] };
+        }
+        return {
+          ...question,
+          status: "answered",
+          score: mapping.score,
+          feedback: mapping.feedback,
+          regions: mapping.regions,
+        };
+      });
+
+      setQuestions(merged);
+      setOrphanAnswers(allOrphans);
       setState("mapping");
     } catch (err) {
       console.error(err);

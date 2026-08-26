@@ -1,40 +1,16 @@
 import { GoogleGenerativeAI, type Part } from '@google/generative-ai';
-import type { NextRequest } from 'next/server';
-import type { BoundingBox } from '@/lib/store';
-
-export const runtime = 'nodejs';
-export const maxDuration = 300;
+import type {
+  AnswersResponse,
+  BoundingBox,
+  ExtractedQuestion,
+  OrphanAnswer,
+} from '@/lib/store';
 
 // gemini-2.5-flash returns 404 for new API keys ("no longer available to new
 // users"); the API itself points at gemini-3.6-flash as the replacement.
 const MODEL = process.env.GEMINI_MODEL ?? 'gemini-3.6-flash';
 
-export interface ExtractedQuestion {
-  id: string;
-  number: number;
-  part?: string;
-  text: string;
-  score: number;
-  maxScore: number;
-  feedback: string;
-  status: 'answered' | 'unanswered' | 'orphan';
-  regions: BoundingBox[];
-}
-
-export interface OrphanAnswer {
-  text: string;
-  regions: BoundingBox[];
-}
-
-export interface ExtractResponse {
-  questions: ExtractedQuestion[];
-  orphanAnswers: OrphanAnswer[];
-}
-
-interface ExtractRequestBody {
-  questionPaperPages?: string[];
-  answerSheetPages?: string[];
-}
+export class ExtractionError extends Error {}
 
 /** A question as Gemini returns it, before we assign ids. */
 interface RawQuestion {
@@ -66,8 +42,6 @@ interface RawMappingResponse {
   mappings?: RawMapping[];
   orphanAnswers?: RawOrphan[];
 }
-
-class ExtractionError extends Error {}
 
 function getModel() {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -136,14 +110,14 @@ async function callGemini(
 const QUESTIONS_PROMPT =
   'You are an exam paper parser. Extract every question from this question paper in printed order. Treat labelled sub-parts as SEPARATE questions — e.g. 11(a) and 11(b) are two entries. Preserve original numbering. Return ONLY a JSON array, no markdown fences: [{"number": 1, "part": null, "text": "full question text", "maxScore": 5}, ...]';
 
-async function extractQuestions(pages: string[]): Promise<ExtractedQuestion[]> {
+export async function extractQuestions(
+  pages: string[]
+): Promise<ExtractedQuestion[]> {
   const raw = await callGemini(pages, QUESTIONS_PROMPT, 'extracting questions');
   const parsed = parseJsonResponse<RawQuestion[]>(raw, 'extracting questions');
 
   if (!Array.isArray(parsed)) {
-    throw new ExtractionError(
-      'Expected a JSON array of questions from Gemini.'
-    );
+    throw new ExtractionError('Expected a JSON array of questions from Gemini.');
   }
 
   return parsed.map((question, index) => ({
@@ -160,15 +134,22 @@ async function extractQuestions(pages: string[]): Promise<ExtractedQuestion[]> {
   }));
 }
 
-/** [yMin, xMin, yMax, xMax] at 0-1000 -> BoundingBox at 0-1. `page` stays 0-indexed. */
-function toBoundingBox(region: RawRegion): BoundingBox | null {
+/**
+ * [yMin, xMin, yMax, xMax] at 0-1000 -> BoundingBox at 0-1.
+ * `pageOffset` maps a batch-local page index back onto the whole document.
+ */
+function toBoundingBox(region: RawRegion, pageOffset: number): BoundingBox | null {
   const box = region?.box_2d;
-  if (!Array.isArray(box) || box.length !== 4 || box.some((n) => typeof n !== 'number')) {
+  if (
+    !Array.isArray(box) ||
+    box.length !== 4 ||
+    box.some((n) => typeof n !== 'number')
+  ) {
     return null;
   }
   const [yMin, xMin, yMax, xMax] = box;
   return {
-    page: Number(region.page) || 0,
+    page: (Number(region.page) || 0) + pageOffset,
     yMin: yMin / 1000,
     xMin: xMin / 1000,
     yMax: yMax / 1000,
@@ -176,10 +157,13 @@ function toBoundingBox(region: RawRegion): BoundingBox | null {
   };
 }
 
-function toBoundingBoxes(regions: RawRegion[] | undefined): BoundingBox[] {
+function toBoundingBoxes(
+  regions: RawRegion[] | undefined,
+  pageOffset: number
+): BoundingBox[] {
   if (!Array.isArray(regions)) return [];
   return regions
-    .map(toBoundingBox)
+    .map((region) => toBoundingBox(region, pageOffset))
     .filter((box): box is BoundingBox => box !== null);
 }
 
@@ -195,84 +179,37 @@ function mappingPrompt(questions: ExtractedQuestion[]): string {
   return (
     'You are an answer sheet analyzer. Here are the questions: ' +
     JSON.stringify(forModel) +
-    '. For each handwritten answer on these pages: match it to a question by number/label, draw a bounding box as box_2d [yMin, xMin, yMax, xMax] normalized 0-1000, score it, and write brief feedback. Return ONLY JSON, no fences: {"mappings": [{"questionId": "q1", "score": 3, "feedback": "brief feedback", "regions": [{"page": 0, "box_2d": [100, 50, 400, 950]}]}], "orphanAnswers": [{"text": "unmatched answer description", "regions": [{"page": 0, "box_2d": [500, 50, 700, 950]}]}]}. page is 0-indexed. If a question has no answer, omit it from mappings. Answers not matching any question go in orphanAnswers.'
+    '. For each handwritten answer on these pages: match it to a question by number/label, draw a bounding box as box_2d [yMin, xMin, yMax, xMax] normalized 0-1000, score it, and write brief feedback. Return ONLY JSON, no fences: {"mappings": [{"questionId": "q1", "score": 3, "feedback": "brief feedback", "regions": [{"page": 0, "box_2d": [100, 50, 400, 950]}]}], "orphanAnswers": [{"text": "unmatched answer description", "regions": [{"page": 0, "box_2d": [500, 50, 700, 950]}]}]}. page is 0-indexed relative to the images in THIS request. If a question has no answer, omit it from mappings. Answers not matching any question go in orphanAnswers.'
   );
 }
 
-async function extractAnswersAndMap(
+/**
+ * Grades one batch of answer-sheet pages. Page indices in the result are
+ * rebased onto the full document via `pageOffset`.
+ */
+export async function extractAnswersAndMap(
   pages: string[],
-  questions: ExtractedQuestion[]
-): Promise<ExtractResponse> {
-  const raw = await callGemini(
-    pages,
-    mappingPrompt(questions),
-    'mapping answers'
-  );
+  questions: ExtractedQuestion[],
+  pageOffset = 0
+): Promise<AnswersResponse> {
+  const raw = await callGemini(pages, mappingPrompt(questions), 'mapping answers');
   const parsed = parseJsonResponse<RawMappingResponse>(raw, 'mapping answers');
 
-  const byQuestionId = new Map<string, RawMapping>();
-  for (const mapping of parsed.mappings ?? []) {
-    if (mapping?.questionId) byQuestionId.set(mapping.questionId, mapping);
-  }
-
-  const merged = questions.map((question): ExtractedQuestion => {
-    const mapping = byQuestionId.get(question.id);
-    if (!mapping) {
-      return { ...question, status: 'unanswered', score: 0, regions: [] };
-    }
-    return {
-      ...question,
-      status: 'answered',
+  const mappings = (parsed.mappings ?? [])
+    .filter((mapping) => mapping?.questionId)
+    .map((mapping) => ({
+      questionId: String(mapping.questionId),
       score: Number(mapping.score) || 0,
       feedback: String(mapping.feedback ?? ''),
-      regions: toBoundingBoxes(mapping.regions),
-    };
-  });
+      regions: toBoundingBoxes(mapping.regions, pageOffset),
+    }));
 
   const orphanAnswers: OrphanAnswer[] = (parsed.orphanAnswers ?? []).map(
     (orphan) => ({
       text: String(orphan?.text ?? ''),
-      regions: toBoundingBoxes(orphan?.regions),
+      regions: toBoundingBoxes(orphan?.regions, pageOffset),
     })
   );
 
-  return { questions: merged, orphanAnswers };
-}
-
-export async function POST(request: NextRequest) {
-  let body: ExtractRequestBody;
-  try {
-    body = await request.json();
-  } catch {
-    return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
-  }
-
-  const { questionPaperPages, answerSheetPages } = body;
-
-  if (!Array.isArray(questionPaperPages) || !Array.isArray(answerSheetPages)) {
-    return Response.json(
-      { error: 'questionPaperPages and answerSheetPages must both be arrays' },
-      { status: 400 }
-    );
-  }
-
-  if (questionPaperPages.length === 0 || answerSheetPages.length === 0) {
-    return Response.json(
-      { error: 'Both documents must have at least one page' },
-      { status: 400 }
-    );
-  }
-
-  try {
-    const questions = await extractQuestions(questionPaperPages);
-    const result = await extractAnswersAndMap(answerSheetPages, questions);
-    return Response.json(result satisfies ExtractResponse);
-  } catch (error) {
-    console.error('[extract] failed:', error);
-    const message =
-      error instanceof ExtractionError
-        ? error.message
-        : 'Extraction failed. See server logs.';
-    return Response.json({ error: message }, { status: 500 });
-  }
+  return { mappings, orphanAnswers };
 }

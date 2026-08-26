@@ -2,8 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronLeft, ChevronRight, Sparkles } from "lucide-react";
-import type { BoundingBox } from "@/lib/store";
-import type { ExtractedQuestion, OrphanAnswer } from "@/app/api/extract/route";
+import type {
+  BoundingBox,
+  ExtractedQuestion,
+  OrphanAnswer,
+} from "@/lib/store";
 
 interface Props {
   questions: ExtractedQuestion[];
