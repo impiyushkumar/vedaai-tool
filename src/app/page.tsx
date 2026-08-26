@@ -1,69 +1,129 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useState } from "react";
+import Sidebar from "@/components/Sidebar";
+import TopBar from "@/components/TopBar";
+import UploadScreen from "@/components/UploadScreen";
+import ProcessingScreen from "@/components/ProcessingScreen";
+import MappingScreen from "@/components/MappingScreen";
+import { getPageCount, renderPdfPages, stripDataUrlPrefix } from "@/lib/pdf";
+import type { AppState, UploadedFile } from "@/lib/store";
+import type {
+  ExtractedQuestion,
+  ExtractResponse,
+  OrphanAnswer,
+} from "@/app/api/extract/route";
+
+export default function Page() {
+  const [state, setState] = useState<AppState>("upload");
+  const [questionPaper, setQuestionPaper] = useState<UploadedFile | null>(null);
+  const [answerSheet, setAnswerSheet] = useState<UploadedFile | null>(null);
+
+  const [status, setStatus] = useState("Rendering pages...");
+  const [error, setError] = useState<string | null>(null);
+
+  // Answer sheet page images are kept as full data URLs for the Phase 5
+  // mapping screen to render directly into <img src>.
+  const [answerSheetImages, setAnswerSheetImages] = useState<string[]>([]);
+  const [questions, setQuestions] = useState<ExtractedQuestion[]>([]);
+  const [orphanAnswers, setOrphanAnswers] = useState<OrphanAnswer[]>([]);
+
+  async function handleSelect(slot: "question" | "answer", file: File) {
+    const pages = await getPageCount(file);
+    const uploaded: UploadedFile = {
+      file,
+      name: file.name,
+      size: file.size,
+      pages,
+    };
+    if (slot === "question") setQuestionPaper(uploaded);
+    else setAnswerSheet(uploaded);
+  }
+
+  function handleClear(slot: "question" | "answer") {
+    if (slot === "question") setQuestionPaper(null);
+    else setAnswerSheet(null);
+  }
+
+  async function handleStart() {
+    if (!questionPaper || !answerSheet) return;
+
+    setError(null);
+    setStatus("Rendering pages...");
+    setState("processing");
+
+    try {
+      // Question paper is only ever sent to the API, so 1.0 is enough.
+      // The answer sheet is rendered twice: 1.0 for the request payload and
+      // 2.0 for the mapping screen, where boxes get zoomed into.
+      const [questionPaperImages, answerImagesForApi, answerImagesForDisplay] =
+        await Promise.all([
+          renderPdfPages(questionPaper.file, 1.0),
+          renderPdfPages(answerSheet.file, 1.0),
+          renderPdfPages(answerSheet.file, 2.0),
+        ]);
+      setAnswerSheetImages(answerImagesForDisplay);
+
+      setStatus("Extracting questions...");
+
+      const response = await fetch("/api/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          questionPaperPages: questionPaperImages.map(stripDataUrlPrefix),
+          answerSheetPages: answerImagesForApi.map(stripDataUrlPrefix),
+        }),
+      });
+
+      if (!response.ok) {
+        const detail = await response
+          .json()
+          .then((data) => data?.error)
+          .catch(() => null);
+        throw new Error(detail || `Extraction request failed (${response.status})`);
+      }
+
+      setStatus("Mapping answers...");
+
+      const result: ExtractResponse = await response.json();
+      setQuestions(result.questions);
+      setOrphanAnswers(result.orphanAnswers);
+      setState("mapping");
+    } catch (err) {
+      console.error(err);
+      setError(
+        err instanceof Error ? err.message : "Something went wrong. Try again."
+      );
+      setState("upload");
+    }
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+    <div className="h-screen overflow-hidden bg-bg md:pl-[220px]">
+      <Sidebar />
+      {/* h-screen + min-h-0 so the mapping panes scroll internally
+          instead of stretching the page. */}
+      <div className="flex h-screen flex-col">
+        <TopBar />
+        {state === "upload" && (
+          <UploadScreen
+            questionPaper={questionPaper}
+            answerSheet={answerSheet}
+            error={error}
+            onSelect={handleSelect}
+            onClear={handleClear}
+            onStart={handleStart}
+          />
+        )}
+        {state === "processing" && <ProcessingScreen status={status} />}
+        {state === "mapping" && (
+          <MappingScreen
+            questions={questions}
+            orphanAnswers={orphanAnswers}
+            pageImages={answerSheetImages}
+          />
+        )}
+      </div>
     </div>
   );
 }

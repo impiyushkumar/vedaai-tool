@@ -1,36 +1,54 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# VedaAI - Assessment Extraction & Answer Mapping
 
-## Getting Started
+AI-powered tool that lets teachers upload a question paper and student answer sheet, extracts questions, maps answers to questions, and highlights the exact answer regions.
 
-First, run the development server:
+## Live Demo
+[Deployed URL will go here]
 
+## Features
+- Upload question paper and answer sheet (PDF or images)
+- AI-powered question extraction preserving original numbering
+- Sub-parts treated as separate questions (e.g. 11a, 11b)
+- Handwritten answer detection with bounding box highlighting
+- Handles out-of-order answers
+- Detects unanswered questions
+- Identifies unmatched/orphan answers
+- AI grading with per-question feedback
+- Responsive design (desktop + mobile)
+
+## Tech Stack
+- **Framework:** Next.js 16 (App Router, TypeScript)
+- **Styling:** Tailwind CSS
+- **AI Model:** Gemini 3.6 Flash (Google AI Studio, free tier)
+- **PDF Rendering:** pdf.js (pdfjs-dist)
+- **Deployment:** Vercel
+
+## How It Works
+1. Teacher uploads question paper PDF and student answer sheet PDF
+2. Pages are rendered to images client-side via pdf.js
+3. Question paper images are sent to Gemini to extract all questions in order
+4. Answer sheet images + extracted questions are sent to Gemini to identify answers, map them to questions, and return bounding boxes (normalized 0-1000)
+5. Results displayed in a two-pane view — questions on the left, highlighted answer sheet on the right
+
+## Approach
+- Single Gemini call per document for extraction
+- Native bounding box detection (0-1000 normalized coordinates)
+- Content-based answer-to-question mapping (not positional)
+- No database — fully in-memory
+
+## Limitations
+- Bounding box accuracy depends on handwriting clarity
+- AI grading is approximate without an answer key
+- Very large PDFs may take longer to process
+
+## Setup
 ```bash
+npm install
+cp .env.local.example .env.local
+# Add your GEMINI_API_KEY to .env.local
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Environment Variables
+- `GEMINI_API_KEY` — Google AI Studio API key
+- `GEMINI_MODEL` — Model name (default: gemini-3.6-flash)
